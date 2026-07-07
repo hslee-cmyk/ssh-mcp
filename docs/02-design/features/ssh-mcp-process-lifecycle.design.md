@@ -105,11 +105,23 @@ Claude Code 세션 시작 → ssh (client) → sshd → python3 ssh_agent.py (co
     │
     ├─ idle_watchdog 60s tick:
     │     - job 실행 중 → 유지
-    │     - idle > 30min AND job 없음 → stdio 루프 정상 종료(exit 0)
+    │     - idle > 30min AND job 없음 → os._exit(0)로 즉시 종료(§2.2.1)
     │
     └─ 세션 종료(client 연결 끊김) → stdin EOF → stdio_server 컨텍스트 정상 종료
           (네트워크 비정상 종료 시에도 idle_watchdog이 결국 회수)
 ```
+
+### 2.2.1 idle-exit 구현 방식 정정 (Gap F, 2026-07-07 cloud0 실측으로 발견)
+
+> Check 단계 cloud0 L3 스모크 도중 발견 — pytest/정적 리뷰로는 잡을 수 없었던 두 번째 실측 버그(Gap E에 이어).
+
+**최초 구현(잘못됨)**: `idle_watchdog`이 `_main_task.cancel()`을 호출해 `CancelledError`가 `stdio_server()`의 `async with` 블록을 타고 올라가 정상 종료되기를 기대했다. 로컬 pytest로는 이 경로 자체를 검증하지 않았다(§8.3에 `idle_watchdog` 전체 루프 테스트가 없었음).
+
+**실측 결과**: cloud0에 `SSH_MCP_IDLE_TIMEOUT_SEC=10`으로 실제 프로세스를 띄워 확인한 결과, `[ssh-mcp] idle timeout (10s) — exiting` 로그는 정확히 예정대로 찍혔다(조건 판정 자체는 정상) — **그런데 프로세스는 3분 넘게 계속 살아있었다.** `mcp.server.stdio`/`Server.run()` 내부가 (추정컨대 anyio 기반이라) 단순 `asyncio.Task.cancel()`을 기대한 방식으로 전파하지 않는 것으로 보인다.
+
+**수정**: `_main_task.cancel()` 대신 `os._exit(0)`을 직접 호출한다. 이게 안전한 이유: idle-exit 조건 자체가 이미 `not _has_running_job()`을 전제하므로, 이 경로에서는 `atexit_handler`가 정리할 대상이 애초에 없다(atexit이 `os._exit`으로 우회되어도 무해함). `_main_task` 전역과 `main()`의 `except asyncio.CancelledError` 분기는 더 이상 필요 없어 제거했다.
+
+**교훈**: 정적 분석·mock 기반 유닛 테스트는 "조건 판정 로직"은 검증하지만, 그 판정 이후 실제로 무슨 일이 일어나는지(제3자 SDK 내부와의 상호작용)는 검증하지 못한다. Do 단계에서 idle_watchdog의 조건 로직만 mock으로 테스트하고 실제 종료까지는 로컬에서 검증하지 않았던 것이 이 버그가 Check 단계까지 남아있던 원인 — Design §8.4(L3)에 명시했던 "idle timeout 실동작 확인" 항목이 실제로 있었기에 발견할 수 있었다.
 
 ### 2.3 Dependencies
 
@@ -451,3 +463,4 @@ ssh-mcp/
 | 0.2 | 2026-07-07 | Plan FR-05 반영 — 신규 tool `ssh_bg_kill` 설계(§4.1). PID 사이드카 파일(`.pid`, §3.1) 도입해 부모 재시작 후에도 kill 가능하게 함. Kill 동작은 atexit_handler와 동일 패턴(SIGTERM→5초→SIGKILL)으로 확정. Test Plan §8.2에 L1 시나리오 4개 추가, Module Map에 `module-3`(ssh_bg_kill) 신설. | hoseung.lee |
 | 0.3 | 2026-07-07 | `ssh_bg_poll` fallback(§6.1.2)의 실제 구현 pseudocode 추가 — `_pid_alive()` 공유 헬퍼(`ssh_bg_kill`과 공용), `JOB_OUTFILE_TMPL`/`JOB_PIDFILE_TMPL` 전역 상수(§3.2)로 4개 코드 경로(`ssh_bg_run`/`ssh_bg_poll`/`ssh_bg_kill`/`job_sweep`)의 경로 포맷 중복 제거. | hoseung.lee |
 | 0.4 | 2026-07-07 | Do+Check 단계 구현/실측 중 발견한 사항 반영: (1) §4.1.1 신규 — 래퍼(bash) pid만 kill하면 내부 실제 명령이 고아로 남는 문제를 실측으로 발견, `start_new_session=True` + `_kill_group()`(프로세스 그룹 kill)으로 수정, POSIX 전용(Windows는 단일 프로세스 kill로 폴백)임을 명시. (2) §8.4에 L3 항목 2개 추가(그룹 kill 확인, SIGTERM 무시→SIGKILL 승격 확인) — 둘 다 로컬 Windows에서는 검증 불가해 cloud0 전용. (3) §4.1 step 4 문구를 실제 Response 포맷(`[no-op] ...`)과 일치하도록 정정(gap-detector Gap C). (4) "6개 tool" 표기를 실제 개수(7개)로 정정(gap-detector Gap D). | hoseung.lee |
+| 0.5 | 2026-07-07 | cloud0 L3 스모크 중 **Gap F** 발견·수정 — `idle_watchdog`이 `_main_task.cancel()`로 종료를 시도했으나, 로그(`idle timeout — exiting`)는 정확히 찍히는데 프로세스는 종료되지 않는 것을 실측 확인(`mcp.server.stdio` 내부의 cancellation 전파 실패로 추정). `os._exit(0)` 직접 호출로 변경(§2.2.1 신규) — 이 경로는 `not _has_running_job()`이 전제라 `atexit` 우회가 무해함. `_main_task` 전역과 `main()`의 `except CancelledError` 분기 제거. Gap E(§4.1.1)에 이어 두 번째로 "정적 분석/mock 테스트로는 못 잡고 실제 프로세스를 띄워봐야만 드러나는" 버그였다. | hoseung.lee |

@@ -42,7 +42,6 @@ JOB_OUTFILE_TMPL = "/tmp/mcp_job_{job_id}.txt"
 JOB_PIDFILE_TMPL = "/tmp/mcp_job_{job_id}.pid"
 
 _last_activity = time.monotonic()
-_main_task: asyncio.Task | None = None
 
 
 def _pid_alive(job_id: str) -> bool:
@@ -178,9 +177,16 @@ def _has_running_job() -> bool:
 
 async def idle_watchdog() -> None:
     """Self-exit when idle and no job is running. Design Ref: §1.1, §2.1 (Option A).
-    Cancels the main task (running inside stdio_server's async-with) so that the
-    stdio transport closes cleanly and the interpreter reaches a normal shutdown
-    (atexit fires — unlike a signal-based kill).
+
+    Uses os._exit(0) rather than cancelling the main task. An earlier version
+    called _main_task.cancel(), expecting CancelledError to unwind through
+    stdio_server()'s `async with` for a cooperative shutdown — verified on
+    cloud0 that this does NOT work: the watchdog logs "idle timeout — exiting"
+    right on schedule, but the process (and app.run()'s read loop, likely
+    anyio-based internally) never actually terminates. os._exit() sidesteps
+    that entirely. This is safe here specifically because the exit condition
+    already requires _has_running_job() to be False — atexit_handler (which
+    os._exit bypasses) would have nothing to clean up on this path anyway.
     """
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
@@ -188,9 +194,7 @@ async def idle_watchdog() -> None:
         idle_for = time.monotonic() - _last_activity
         if idle_for > IDLE_TIMEOUT_SEC and not _has_running_job():
             print(f"[ssh-mcp] idle timeout ({IDLE_TIMEOUT_SEC}s) — exiting", file=sys.stderr)
-            if _main_task is not None:
-                _main_task.cancel()
-            return
+            os._exit(0)
 
 
 def atexit_handler() -> None:
@@ -493,8 +497,6 @@ async def call_tool(name: str, arguments: dict):
 # ─── 엔트리포인트 ─────────────────────────────────────────────────────────────
 
 async def main():
-    global _main_task
-    _main_task = asyncio.current_task()
     watchdog_task = asyncio.create_task(idle_watchdog())
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -503,8 +505,6 @@ async def main():
                 write_stream,
                 app.create_initialization_options(),
             )
-    except asyncio.CancelledError:
-        pass
     finally:
         watchdog_task.cancel()
 
