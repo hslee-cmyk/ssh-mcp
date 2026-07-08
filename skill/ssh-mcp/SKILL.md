@@ -41,9 +41,12 @@ user-invocable: false
 
 ## 2. 세션이 끊기거나 서버가 재시작해도 job은 안전하다
 
-- `ssh` 서버 프로세스는 **30분(`SSH_MCP_IDLE_TIMEOUT_SEC`, 기본 1800초) 동안 툴 호출이 없으면
-  스스로 종료**한다. 다음 호출 시 SSH가 새 프로세스를 자동으로 띄워주므로 사용자 입장에서는
-  아무 조치도 필요 없다 — 다만 그 프로세스의 메모리 상태(`_jobs` dict)는 사라진다.
+- `ssh` 서버 프로세스는 더 이상 활동 타이머로 스스로 종료하지 않는다(구 `idle_watchdog`/
+  `SSH_MCP_IDLE_TIMEOUT_SEC` 제거됨). 오직 `stdin` EOF(SSH 연결이 실제로 끊겼을 때)에서만
+  정상 종료한다 — 조용히 오래 작업 중이어도 재연결이 필요 없다. 죽은 연결은 클라이언트 SSH
+  keepalive로 ~90초 내 감지되어 EOF로 이어지고, 그마저 놓친 방치 프로세스는 cloud0의 외부
+  `idle_culler.py` cron(고아+age 백스톱, 실행 중 job은 항상 보존)이 정리한다. 프로세스가
+  재시작되면 그 프로세스의 메모리 상태(`_jobs` dict)는 사라진다.
 - 그래도 백그라운드 job은 안전하다: job의 출력은 `/tmp/mcp_job_{job_id}.txt`, PID는
   `/tmp/mcp_job_{job_id}.pid`에 디스크로 기록된다. `ssh_bg_poll`/`ssh_bg_kill`은 메모리에 job이
   없으면 이 파일들을 읽어 복구한다 — 즉 어제 시작한 job의 `job_id`를 오늘 새 세션에서 poll하거나

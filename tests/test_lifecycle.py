@@ -62,61 +62,11 @@ def test_has_running_job_false_when_empty():
     assert ssh_agent._has_running_job() is False
 
 
-# ─── idle_watchdog exit trigger ────────────────────────────────────────────
-#
-# Regression test for a bug found on cloud0: an earlier version called
-# _main_task.cancel() here, expecting CancelledError to unwind cleanly through
-# stdio_server()'s `async with` — verified live that the process never
-# actually terminated even though this exact log line printed on schedule.
-# Switched to os._exit(0) (safe here because the trigger condition already
-# guarantees no job is running). Mock os._exit so the test process itself
-# doesn't die, and use it to break out of idle_watchdog's `while True` loop.
-
-def test_idle_watchdog_calls_os_exit_when_idle_and_no_job(monkeypatch):
-    monkeypatch.setattr(ssh_agent, "WATCHDOG_INTERVAL_SEC", 0.01)
-    monkeypatch.setattr(ssh_agent, "IDLE_TIMEOUT_SEC", 0)
-    ssh_agent._last_activity = time.monotonic() - 100  # already idle
-
-    calls = []
-
-    class _StopLoop(Exception):
-        pass
-
-    def fake_exit(code):
-        calls.append(code)
-        raise _StopLoop()
-
-    monkeypatch.setattr(os, "_exit", fake_exit)
-
-    with pytest.raises(_StopLoop):
-        run(ssh_agent.idle_watchdog())
-
-    assert calls == [0]
-
-
-def test_idle_watchdog_does_not_exit_while_job_running(monkeypatch):
-    monkeypatch.setattr(ssh_agent, "WATCHDOG_INTERVAL_SEC", 0.01)
-    monkeypatch.setattr(ssh_agent, "IDLE_TIMEOUT_SEC", 0)
-    ssh_agent._last_activity = time.monotonic() - 100
-    ssh_agent._jobs["j1"] = {"process": FakeProc(running=True), "outfile": "x", "pidfile": "y", "finished_at": None}
-
-    calls = []
-    monkeypatch.setattr(os, "_exit", lambda code: calls.append(code))
-
-    async def run_briefly():
-        task = asyncio.ensure_future(ssh_agent.idle_watchdog())
-        await asyncio.sleep(0.05)  # a few ticks
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    run(run_briefly())
-    assert calls == []
-
-
 # ─── job_sweep: zombie reap (FR-02) + retention cleanup (FR-04) ───────────
+#
+# job_sweep() used to run on a WATCHDOG_INTERVAL_SEC timer from idle_watchdog();
+# with that watchdog removed (ssh-mcp-idle-culler.design.md §3.1), it is now
+# called opportunistically from call_tool()'s entry point instead.
 
 def test_job_sweep_marks_finished_and_reaps_zombie():
     proc = FakeProc(running=False)
@@ -149,6 +99,13 @@ def test_job_sweep_cleans_up_after_retention(tmp_path, monkeypatch):
     assert "j1" not in ssh_agent._jobs
     assert not outfile.exists()
     assert not pidfile.exists()
+
+
+def test_call_tool_triggers_job_sweep(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ssh_agent, "job_sweep", lambda: calls.append(1))
+    run(call_tool("file_ls", {"path": "."}))
+    assert calls == [1]
 
 
 def test_job_sweep_retains_recently_finished_job(tmp_path):

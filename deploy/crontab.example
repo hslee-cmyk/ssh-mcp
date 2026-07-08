@@ -1,0 +1,16 @@
+# ssh-mcp idle-culler (cron-based, root/admin not required).
+#
+# See docs/02-design/features/ssh-mcp-idle-culler.design.md §4/§11.2.
+# Install with: crontab -e   (as the same user ssh_agent.py runs as, e.g. hoseung.lee)
+#
+# Do not `crontab this-file` blindly if you already have other cron entries
+# (e.g. xcelium-mcp's supervisor/culler) — merge this line into your existing
+# crontab instead of overwriting it.
+#
+# idle_culler.py is a single-file script (no package/module), unlike
+# xcelium-mcp's `python3 -m xcelium_mcp.idle_culler` — invoke it directly by path.
+
+*/5 * * * *     /opt/mcp-env/bin/python3 /opt/ssh-mcp/idle_culler.py
+
+# Override the age backstop threshold (default 6h) if needed:
+# */5 * * * *   SSH_MCP_CULLER_IDLE_THRESHOLD_SEC=3600 /opt/mcp-env/bin/python3 /opt/ssh-mcp/idle_culler.py

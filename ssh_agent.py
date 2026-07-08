@@ -5,8 +5,10 @@ Register in ~/.claude.json:
   "ssh": { "command": "ssh", "args": ["-o","BatchMode=yes","cloud0",
            "/opt/mcp-env/bin/python3", "/opt/mcp-servers/ssh_agent.py"] }
 
-Process lifecycle (idle self-exit, job reap, ssh_bg_kill):
+Process lifecycle (EOF-only exit, job reap, ssh_bg_kill):
   Design Ref: docs/02-design/features/ssh-mcp-process-lifecycle.design.md
+              docs/02-design/features/ssh-mcp-idle-culler.design.md (idle_watchdog removal;
+              stray processes now reaped externally by idle_culler.py on cloud0)
 """
 
 import asyncio
@@ -28,20 +30,14 @@ _jobs: dict = {}
 
 
 # ─── Lifecycle ──────────────────────────────────────────────────────────────
-# Design Ref: §2 (Option A — self idle-exit), §3.2 (globals), §4.1 (ssh_bg_kill),
-#             §6.1.2 (ssh_bg_poll fallback / _pid_alive)
+# Design Ref: docs/02-design/features/ssh-mcp-idle-culler.design.md §3.1
+#             (idle_watchdog/IDLE_TIMEOUT_SEC/WATCHDOG_INTERVAL_SEC/_last_activity
+#             removed — process now exits only on stdin EOF via stdio_server()).
+#             §4.1 (ssh_bg_kill), §6.1.2 (ssh_bg_poll fallback / _pid_alive)
 
-try:
-    IDLE_TIMEOUT_SEC = int(os.environ.get("SSH_MCP_IDLE_TIMEOUT_SEC", "1800"))
-except ValueError:
-    IDLE_TIMEOUT_SEC = 1800
-
-WATCHDOG_INTERVAL_SEC = 60
 JOB_RETENTION_SEC = 86400  # 24h — Design §3.2, FR-04
 JOB_OUTFILE_TMPL = "/tmp/mcp_job_{job_id}.txt"
 JOB_PIDFILE_TMPL = "/tmp/mcp_job_{job_id}.pid"
-
-_last_activity = time.monotonic()
 
 
 def _pid_alive(job_id: str) -> bool:
@@ -144,8 +140,9 @@ async def _kill_pid_async(pid: int, proc: subprocess.Popen | None, grace_sec: fl
 
 def job_sweep() -> None:
     """Reap finished children (zombie prevention, FR-02) and clean up entries that
-    finished more than JOB_RETENTION_SEC ago (FR-04). Runs every WATCHDOG_INTERVAL_SEC
-    from idle_watchdog(). Design Ref: §2.1, §3.2.
+    finished more than JOB_RETENTION_SEC ago (FR-04). Called opportunistically from
+    call_tool()'s entry point (idle-culler design §3.1 — no periodic watchdog task
+    remains to drive this). Design Ref: §2.1, §3.2.
     """
     now = time.monotonic()
     stale = []
@@ -173,28 +170,6 @@ def job_sweep() -> None:
 
 def _has_running_job() -> bool:
     return any(job["finished_at"] is None for job in _jobs.values())
-
-
-async def idle_watchdog() -> None:
-    """Self-exit when idle and no job is running. Design Ref: §1.1, §2.1 (Option A).
-
-    Uses os._exit(0) rather than cancelling the main task. An earlier version
-    called _main_task.cancel(), expecting CancelledError to unwind through
-    stdio_server()'s `async with` for a cooperative shutdown — verified on
-    cloud0 that this does NOT work: the watchdog logs "idle timeout — exiting"
-    right on schedule, but the process (and app.run()'s read loop, likely
-    anyio-based internally) never actually terminates. os._exit() sidesteps
-    that entirely. This is safe here specifically because the exit condition
-    already requires _has_running_job() to be False — atexit_handler (which
-    os._exit bypasses) would have nothing to clean up on this path anyway.
-    """
-    while True:
-        await asyncio.sleep(WATCHDOG_INTERVAL_SEC)
-        job_sweep()
-        idle_for = time.monotonic() - _last_activity
-        if idle_for > IDLE_TIMEOUT_SEC and not _has_running_job():
-            print(f"[ssh-mcp] idle timeout ({IDLE_TIMEOUT_SEC}s) — exiting", file=sys.stderr)
-            os._exit(0)
 
 
 def atexit_handler() -> None:
@@ -326,8 +301,7 @@ async def list_tools():
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
-    global _last_activity
-    _last_activity = time.monotonic()
+    job_sweep()
 
     # ── ssh_run ──────────────────────────────────────────────────────────────
     if name == "ssh_run":
@@ -497,16 +471,12 @@ async def call_tool(name: str, arguments: dict):
 # ─── 엔트리포인트 ─────────────────────────────────────────────────────────────
 
 async def main():
-    watchdog_task = asyncio.create_task(idle_watchdog())
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options(),
-            )
-    finally:
-        watchdog_task.cancel()
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(
+            read_stream,
+            write_stream,
+            app.create_initialization_options(),
+        )
 
 if __name__ == "__main__":
     atexit.register(atexit_handler)
